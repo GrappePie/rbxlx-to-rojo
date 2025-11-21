@@ -1,8 +1,6 @@
 use log::debug;
-use rbx_dom_weak::{
-    types::{Ref, Variant},
-    Instance, WeakDom,
-};
+use rbx_dom_weak::{ustr, types::{Ref, Variant}, Instance, WeakDom};
+use rbx_reflection::ClassTag;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
@@ -22,6 +20,37 @@ lazy_static::lazy_static! {
     static ref RESPECTED_SERVICES: HashSet<&'static str> = include_str!("./respected-services.txt").lines().collect();
 }
 
+fn sanitize_name(name: &str) -> String {
+    let mut sanitized: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            _ => c,
+        })
+        .collect();
+
+    while sanitized.ends_with('.') || sanitized.ends_with(' ') {
+        sanitized.pop();
+    }
+
+    if sanitized.is_empty() {
+        "_".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn get_class_descriptor(class_name: &str) -> Option<&'static rbx_reflection::ClassDescriptor<'static>> {
+    match rbx_reflection_database::get() {
+        Ok(database) => database.classes.get(class_name),
+        Err(error) => {
+            debug!("could not load reflection database: {}", error);
+            None
+        }
+    }
+}
+
 struct TreeIterator<'a, I: InstructionReader + ?Sized> {
     instruction_reader: &'a mut I,
     path: &'a Path,
@@ -37,9 +66,11 @@ fn repr_instance<'a>(
         return None;
     }
 
+    let sanitized_name = sanitize_name(&child.name);
+
     match child.class.as_str() {
         "Folder" => {
-            let folder_path = base.join(&child.name);
+            let folder_path = base.join(&sanitized_name);
             let owned: Cow<'a, Path> = Cow::Owned(folder_path);
             let clone = owned.clone();
             Some((
@@ -71,7 +102,7 @@ fn repr_instance<'a>(
                 _ => unreachable!(),
             };
 
-            let source = match child.properties.get("Source").expect("no Source") {
+            let source = match child.properties.get(&ustr("Source")).expect("no Source") {
                 Variant::String(value) => value,
                 _ => unreachable!(),
             }
@@ -80,7 +111,7 @@ fn repr_instance<'a>(
             if child.children().is_empty() {
                 Some((
                     vec![Instruction::CreateFile {
-                        filename: Cow::Owned(base.join(format!("{}{}.lua", child.name, extension))),
+                        filename: Cow::Owned(base.join(format!("{}{}.lua", sanitized_name, extension))),
                         contents: Cow::Borrowed(source),
                     }],
                     Cow::Borrowed(base),
@@ -104,7 +135,7 @@ fn repr_instance<'a>(
                     .count();
 
                 let total_children_count = child.children().len();
-                let folder_path: Cow<'a, Path> = Cow::Owned(base.join(&child.name));
+            let folder_path: Cow<'a, Path> = Cow::Owned(base.join(&sanitized_name));
 
                 // If there's no script children, make a named meta file
                 // If there's some script children, make a folder with a meta file
@@ -130,13 +161,13 @@ fn repr_instance<'a>(
                         vec![
                             Instruction::CreateFile {
                                 filename: Cow::Owned(
-                                    base.join(format!("{}{}.lua", child.name, extension)),
+                                    base.join(format!("{}{}.lua", sanitized_name, extension)),
                                 ),
                                 contents: Cow::Borrowed(source),
                             },
                             Instruction::CreateFile {
                                 filename: Cow::Owned(
-                                    base.join(format!("{}.meta.json", child.name)),
+                                    base.join(format!("{}.meta.json", sanitized_name)),
                                 ),
                                 contents: meta_contents,
                             },
@@ -168,11 +199,13 @@ fn repr_instance<'a>(
 
         other_class => {
             // When all else fails, we can make a meta folder if there's scripts in it
-            match rbx_reflection::get_class_descriptor(other_class) {
+            match get_class_descriptor(other_class) {
                 Some(reflected) => {
                     let treat_as_service = RESPECTED_SERVICES.contains(other_class);
+                    let is_service = reflected.tags.contains(&ClassTag::Service);
+
                     // Don't represent services not in respected-services
-                    if reflected.is_service() && !treat_as_service {
+                    if is_service && !treat_as_service {
                         return None;
                     }
 
@@ -182,7 +215,7 @@ fn repr_instance<'a>(
                             return None;
                         }
 
-                        let new_base: Cow<'a, Path> = Cow::Owned(base.join(&child.name));
+                        let new_base: Cow<'a, Path> = Cow::Owned(base.join(&sanitized_name));
                         let mut instructions = Vec::new();
 
                         if !NON_TREE_SERVICES.contains(other_class) {
@@ -206,9 +239,9 @@ fn repr_instance<'a>(
             }
 
             // If there are scripts, we'll need to make a .meta.json folder
-            let folder_path: Cow<'a, Path> = Cow::Owned(base.join(&child.name));
+            let folder_path: Cow<'a, Path> = Cow::Owned(base.join(&sanitized_name));
             let meta = MetaFile {
-                class_name: Some(child.class.clone()),
+                class_name: Some(child.class.to_string()),
                 // properties: properties.into_iter().collect(),
                 ignore_unknown_instances: true,
             };
@@ -239,10 +272,11 @@ impl<'a, I: InstructionReader + ?Sized> TreeIterator<'a, I> {
         for child_id in instance.children() {
             let child = self.tree.get_by_ref(*child_id).expect("got fake child id?");
 
-            let (instructions_to_create_base, path) = if child.class == "StarterPlayer" {
+            let sanitized_name = sanitize_name(&child.name);
+            let (instructions_to_create_base, path) = if child.class.as_str() == "StarterPlayer" {
                 // We can't respect StarterPlayer as a service, because then Rojo
                 // tries to delete StarterPlayerScripts and whatnot, which is not valid.
-                let folder_path: Cow<'a, Path> = Cow::Owned(self.path.join(&child.name));
+                let folder_path: Cow<'a, Path> = Cow::Owned(self.path.join(&sanitized_name));
                 let mut instructions = Vec::new();
 
                 if has_scripts.get(child_id) == Some(&true) {
@@ -253,7 +287,7 @@ impl<'a, I: InstructionReader + ?Sized> TreeIterator<'a, I> {
                     instructions.push(Instruction::AddToTree {
                         name: child.name.clone(),
                         partition: TreePartition {
-                            class_name: child.class.clone(),
+                            class_name: child.class.to_string(),
                             children: child
                                 .children()
                                 .iter()
@@ -264,7 +298,7 @@ impl<'a, I: InstructionReader + ?Sized> TreeIterator<'a, I> {
                                         child.name.clone(),
                                         Instruction::partition(
                                             &child,
-                                            folder_path.join(&child.name),
+                                            folder_path.join(&sanitize_name(&child.name)),
                                         ),
                                     )
                                 })

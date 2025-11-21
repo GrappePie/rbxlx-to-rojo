@@ -3,10 +3,11 @@ use rbxlx_to_rojo::{filesystem::FileSystem, process_instructions};
 use std::{
     borrow::Cow,
     fmt, fs,
-    io::{self, BufReader, Write},
+    io::{self, BufReader, Read, Write},
     path::PathBuf,
     sync::{Arc, RwLock},
 };
+use regex::Regex;
 
 #[derive(Debug)]
 enum Problem {
@@ -77,6 +78,152 @@ impl log::Log for WrappedLogger {
     fn flush(&self) {}
 }
 
+fn is_valid_xml_codepoint(code: u32) -> bool {
+    match code {
+        0x9 | 0xA | 0xD => true,
+        0x20..=0xD7FF => true,
+        0xE000..=0xFFFD => true,
+        0x10000..=0x10FFFF => true,
+        _ => false,
+    }
+}
+
+fn sanitize_xml(text: &mut String) -> bool {
+    if text.chars().all(|c| is_valid_xml_codepoint(c as u32)) {
+        return false;
+    }
+
+    let mut cleaned = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if is_valid_xml_codepoint(ch as u32) {
+            cleaned.push(ch);
+        }
+    }
+
+    *text = cleaned;
+    true
+}
+
+fn strip_invalid_numeric_char_refs(text: &mut String) -> bool {
+    // Matches both decimal and hex numeric character references.
+    lazy_static::lazy_static! {
+        static ref NUMERIC_CHAR_REF_RE: Regex = Regex::new(r"&#(x[0-9A-Fa-f]+|[0-9]+);").unwrap();
+    }
+
+    let mut changed = false;
+    let replaced = NUMERIC_CHAR_REF_RE.replace_all(text, |caps: &regex::Captures| {
+        let raw = &caps[1];
+        let value = if raw.starts_with('x') || raw.starts_with('X') {
+            u32::from_str_radix(&raw[1..], 16).ok()
+        } else {
+            raw.parse::<u32>().ok()
+        };
+
+        match value {
+            Some(code) if is_valid_xml_codepoint(code) => caps[0].to_string(),
+            _ => {
+                changed = true;
+                String::new()
+            }
+        }
+    });
+
+    if changed {
+        *text = replaced.into_owned();
+    }
+
+    changed
+}
+
+fn replace_invalid_float_literals(text: &mut String) -> bool {
+    lazy_static::lazy_static! {
+        static ref INVALID_FLOAT_TOKEN_RE: Regex = Regex::new(
+            r"(?i)(-?nan(?:\\([^)]*\\))?|1\\.\\#(?:inf|ind|qnan|nan)|-?inf)"
+        )
+        .unwrap();
+        static ref FLOAT_FIELD_RE: Regex = Regex::new(
+            r"(>\\s*)(-?[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|[^<\\s]+)(\\s*<)"
+        )
+        .unwrap();
+        static ref NUMBER_SEQUENCE_RE: Regex = Regex::new(
+            r"(<NumberSequence[^>]*>)([^<]+)(</NumberSequence>)"
+        )
+        .unwrap();
+        static ref NUMBER_RANGE_RE: Regex = Regex::new(
+            r"(<NumberRange[^>]*>)([^<]+)(</NumberRange>)"
+        )
+        .unwrap();
+    }
+
+    let mut changed = false;
+
+    // Replace obvious tokens first.
+    if INVALID_FLOAT_TOKEN_RE.is_match(text) {
+        let replaced = INVALID_FLOAT_TOKEN_RE.replace_all(text, "0");
+        *text = replaced.into_owned();
+        changed = true;
+    }
+
+    // Normalize any non-parsable tokens inside NumberSequence/NumberRange elements to 0.
+    let normalize_list = |list: &str| -> String {
+        list.split_whitespace()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<f64>().ok().map(|v| v.to_string()).unwrap_or_else(|| "0".to_string()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    let replaced_ns = NUMBER_SEQUENCE_RE.replace_all(text, |caps: &regex::Captures| {
+        changed = true;
+        format!("{}{}{}", &caps[1], normalize_list(&caps[2]), &caps[3])
+    });
+    *text = replaced_ns.into_owned();
+
+    let replaced_nr = NUMBER_RANGE_RE.replace_all(text, |caps: &regex::Captures| {
+        changed = true;
+        format!("{}{}{}", &caps[1], normalize_list(&caps[2]), &caps[3])
+    });
+    *text = replaced_nr.into_owned();
+
+    changed
+}
+
+fn protect_shared_sections(text: &str) -> (String, Vec<String>) {
+    lazy_static::lazy_static! {
+        static ref PROTECTED_RE: Regex =
+            Regex::new(r"(?is)<(?:SharedString|BinaryString)[^>]*>.*?</(?:SharedString|BinaryString)>")
+                .unwrap();
+    }
+
+    let mut protected: Vec<String> = Vec::new();
+    let mut result = String::with_capacity(text.len());
+    let mut last = 0;
+    for (idx, mat) in PROTECTED_RE.find_iter(text).enumerate() {
+        result.push_str(&text[last..mat.start()]);
+        let placeholder = format!("__RBX_PROTECTED_CHUNK_{}__", idx);
+        protected.push(text[mat.start()..mat.end()].to_string());
+        result.push_str(&placeholder);
+        last = mat.end();
+    }
+    result.push_str(&text[last..]);
+
+    (result, protected)
+}
+
+fn restore_shared_sections(text: &mut String, protected: Vec<String>) {
+    lazy_static::lazy_static! {
+        static ref PLACEHOLDER_RE: Regex =
+            Regex::new(r"__RBX_PROTECTED_CHUNK_(\d+)__").unwrap();
+    }
+
+    let replaced = PLACEHOLDER_RE.replace_all(text, |caps: &regex::Captures| {
+        let idx: usize = caps[1].parse().unwrap_or(usize::MAX);
+        protected.get(idx).cloned().unwrap_or_default()
+    });
+    *text = replaced.into_owned();
+}
+
 fn routine() -> Result<(), Problem> {
     let env_logger = env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
@@ -117,10 +264,37 @@ fn routine() -> Result<(), Problem> {
         .map(|extension| extension.to_string_lossy())
     {
         Some(Cow::Borrowed("rbxmx")) | Some(Cow::Borrowed("rbxlx")) => {
-            rbx_xml::from_reader_default(file_source).map_err(Problem::XMLDecodeError)
+            let mut reader = file_source;
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .map_err(|error| Problem::IoError("read the place file", error))?;
+
+            let contents = String::from_utf8_lossy(&bytes).into_owned();
+            if contents.len() != bytes.len() {
+                log::warn!("Replaced invalid UTF-8 bytes while reading XML; content was lossily decoded.");
+            }
+
+            let (mut safe_contents, protected) = protect_shared_sections(&contents);
+
+            if replace_invalid_float_literals(&mut safe_contents) {
+                log::warn!("Replaced invalid float literals before decoding.");
+            }
+
+            if strip_invalid_numeric_char_refs(&mut safe_contents) {
+                log::warn!("Stripped invalid numeric character references before decoding.");
+            }
+
+            if sanitize_xml(&mut safe_contents) {
+                log::warn!("Stripped invalid XML characters before decoding.");
+            }
+
+            restore_shared_sections(&mut safe_contents, protected);
+
+            rbx_xml::from_str_default(&safe_contents).map_err(Problem::XMLDecodeError)
         }
         Some(Cow::Borrowed("rbxm")) | Some(Cow::Borrowed("rbxl")) => {
-            rbx_binary::from_reader_default(file_source).map_err(Problem::BinaryDecodeError)
+            rbx_binary::from_reader(file_source).map_err(Problem::BinaryDecodeError)
         }
         _ => Err(Problem::InvalidFile),
     }?;
