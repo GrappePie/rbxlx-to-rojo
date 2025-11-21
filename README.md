@@ -29,3 +29,10 @@ Congratulations, you successfully ported an existing game using rbxlx-to-rojo!
 
 ## License
 rbxlx-to-rojo is available under The Mozilla Public License, Version 2. Details are available in [LICENSE.md](LICENSE.md).
+
+## Recent compatibility notes
+- Dependencies now point to the `rbx-dom` family from the upstream repo to support modern Roblox types and properties.
+- XML parsing sanitizes problematic input: removes invalid XML characters, replaces illegal numeric literals (`nan`, `inf`, `1.#IND`, etc.), and preserves `SharedString`/`BinaryString` blocks untouched.
+- Instance names are normalized when writing to disk to avoid invalid path characters on Windows (e.g. `:` or `*`), keeping the structure Rojo expects.
+
+See also: [CHANGELOG_PATCH.md](CHANGELOG_PATCH.md) for details of the latest patches.
